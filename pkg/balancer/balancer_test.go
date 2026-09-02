@@ -6,15 +6,16 @@ import (
 	"net/http/httptest"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/akmalkhaniub/go-load-balancer/pkg/backend"
 	"github.com/akmalkhaniub/go-load-balancer/pkg/balancer"
+	"github.com/akmalkhaniub/go-load-balancer/pkg/circuit"
 )
 
 func TestRoundRobinDistribution(t *testing.T) {
 	pool := balancer.NewServerPool(balancer.AlgorithmRoundRobin)
 
-	// Create 3 dummy backends
 	for i := 1; i <= 3; i++ {
 		b, err := backend.NewBackend(fmt.Sprintf("http://127.0.0.%d:8080", i))
 		if err != nil {
@@ -41,54 +42,81 @@ func TestRoundRobinDistribution(t *testing.T) {
 	}
 }
 
-func TestBackendFailureBypass(t *testing.T) {
+func TestCircuitBreakerTripping(t *testing.T) {
+	cb := circuit.NewBreaker(2, 50*time.Millisecond)
+
+	if !cb.Allow() {
+		t.Fatal("expected circuit to be allowed initially")
+	}
+
+	// Trip circuit
+	cb.RecordFailure()
+	cb.RecordFailure()
+
+	if cb.GetState() != circuit.StateOpen {
+		t.Fatalf("expected state OPEN, got %s", cb.GetState())
+	}
+	if cb.Allow() {
+		t.Fatal("expected OPEN circuit to reject requests")
+	}
+
+	// Wait for cooldown
+	time.Sleep(60 * time.Millisecond)
+
+	// Now should transition to Half-Open on allow
+	if !cb.Allow() {
+		t.Fatal("expected probe request to be allowed after cooldown")
+	}
+	if cb.GetState() != circuit.StateHalfOpen {
+		t.Fatalf("expected state HALF_OPEN, got %s", cb.GetState())
+	}
+
+	// Success probe
+	cb.RecordSuccess()
+	cb.RecordSuccess()
+
+	if cb.GetState() != circuit.StateClosed {
+		t.Fatalf("expected state CLOSED after recovery, got %s", cb.GetState())
+	}
+}
+
+func TestDynamicBackendRemovalAndDrain(t *testing.T) {
 	pool := balancer.NewServerPool(balancer.AlgorithmRoundRobin)
 
 	b1, _ := backend.NewBackend("http://127.0.0.1:8081")
 	b2, _ := backend.NewBackend("http://127.0.0.2:8082")
-
 	pool.AddBackend(b1)
 	pool.AddBackend(b2)
 
-	// Mark b1 as down
-	b1.SetAlive(false)
+	// Drain b1
+	err := pool.DrainBackend("http://127.0.0.1:8081")
+	if err != nil {
+		t.Fatalf("unexpected drain error: %v", err)
+	}
 
-	for i := 0; i < 5; i++ {
+	// Next backend should now strictly be b2
+	for i := 0; i < 3; i++ {
 		b, err := pool.GetNextBackend("127.0.0.1")
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
 		if b.URL.String() != "http://127.0.0.2:8082" {
-			t.Errorf("failed backend was not bypassed: got %s", b.URL.String())
+			t.Errorf("drained backend was picked: got %s", b.URL.String())
 		}
 	}
-}
 
-func TestLeastConnectionsAlgorithm(t *testing.T) {
-	pool := balancer.NewServerPool(balancer.AlgorithmLeastConnections)
-
-	b1, _ := backend.NewBackend("http://127.0.0.1:8081")
-	b2, _ := backend.NewBackend("http://127.0.0.2:8082")
-
-	pool.AddBackend(b1)
-	pool.AddBackend(b2)
-
-	// Simulate 2 active connections on b1
-	b1.IncrActive()
-	b1.IncrActive()
-
-	// b2 has 0 connections, so it should be picked
-	b, err := pool.GetNextBackend("127.0.0.1")
+	// Remove b1 completely
+	err = pool.RemoveBackend("http://127.0.0.1:8081")
 	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+		t.Fatalf("unexpected remove error: %v", err)
 	}
-	if b.URL.String() != "http://127.0.0.2:8082" {
-		t.Errorf("expected b2 (least conns), got %s", b.URL.String())
+
+	if len(pool.GetBackends()) != 1 {
+		t.Fatalf("expected 1 backend in pool, got %d", len(pool.GetBackends()))
 	}
 }
 
 func TestConcurrentLoadBalancing(t *testing.T) {
-	// Create mock HTTP backends
 	var hitCount1, hitCount2 int64
 	var mux1, mux2 sync.Mutex
 

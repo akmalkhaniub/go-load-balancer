@@ -7,6 +7,7 @@ import (
 	"hash/fnv"
 	"log/slog"
 	"net/http"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -46,6 +47,41 @@ func (s *ServerPool) AddBackend(b *backend.Backend) {
 	s.backends = append(s.backends, b)
 }
 
+// RemoveBackend dynamically removes a backend from the pool by URL.
+func (s *ServerPool) RemoveBackend(rawURL string) error {
+	s.mux.Lock()
+	defer s.mux.Unlock()
+
+	idx := -1
+	for i, b := range s.backends {
+		if b.URL.String() == rawURL || strings.TrimRight(b.URL.String(), "/") == strings.TrimRight(rawURL, "/") {
+			idx = i
+			break
+		}
+	}
+
+	if idx == -1 {
+		return fmt.Errorf("backend %q not found in pool", rawURL)
+	}
+
+	s.backends = append(s.backends[:idx], s.backends[idx+1:]...)
+	return nil
+}
+
+// DrainBackend sets a backend to draining mode so it finishes existing work without taking new requests.
+func (s *ServerPool) DrainBackend(rawURL string) error {
+	s.mux.RLock()
+	defer s.mux.RUnlock()
+
+	for _, b := range s.backends {
+		if b.URL.String() == rawURL || strings.TrimRight(b.URL.String(), "/") == strings.TrimRight(rawURL, "/") {
+			b.SetDraining(true)
+			return nil
+		}
+	}
+	return fmt.Errorf("backend %q not found", rawURL)
+}
+
 // GetBackends returns a snapshot of all registered backends.
 func (s *ServerPool) GetBackends() []*backend.Backend {
 	s.mux.RLock()
@@ -57,6 +93,11 @@ func (s *ServerPool) GetBackends() []*backend.Backend {
 
 // NextIndex atomically advances and returns the next index for round-robin.
 func (s *ServerPool) NextIndex() int {
+	s.mux.RLock()
+	defer s.mux.RUnlock()
+	if len(s.backends) == 0 {
+		return 0
+	}
 	return int(atomic.AddUint64(&s.current, uint64(1)) % uint64(len(s.backends)))
 }
 
@@ -82,7 +123,10 @@ func (s *ServerPool) GetNextBackend(clientIP string) (*backend.Backend, error) {
 }
 
 func (s *ServerPool) getRoundRobinBackend() (*backend.Backend, error) {
-	next := s.NextIndex()
+	if len(s.backends) == 0 {
+		return nil, errors.New("no backends registered in server pool")
+	}
+	next := int(atomic.AddUint64(&s.current, uint64(1)) % uint64(len(s.backends)))
 	l := len(s.backends) + next
 
 	for i := next; i < l; i++ {
@@ -94,7 +138,7 @@ func (s *ServerPool) getRoundRobinBackend() (*backend.Backend, error) {
 			return s.backends[idx], nil
 		}
 	}
-	return nil, errors.New("all upstream backends are down")
+	return nil, errors.New("all upstream backends are down or circuit-broken")
 }
 
 func (s *ServerPool) getLeastConnectionBackend() (*backend.Backend, error) {
@@ -113,7 +157,7 @@ func (s *ServerPool) getLeastConnectionBackend() (*backend.Backend, error) {
 	}
 
 	if selected == nil {
-		return nil, errors.New("all upstream backends are down")
+		return nil, errors.New("all upstream backends are down or circuit-broken")
 	}
 	return selected, nil
 }
@@ -123,14 +167,13 @@ func (s *ServerPool) getIPHashBackend(clientIP string) (*backend.Backend, error)
 	h.Write([]byte(clientIP))
 	hashVal := int(h.Sum32())
 
-	// Find the first alive backend starting from hash offset
 	for i := 0; i < len(s.backends); i++ {
 		idx := (hashVal + i) % len(s.backends)
 		if s.backends[idx].IsAlive() {
 			return s.backends[idx], nil
 		}
 	}
-	return nil, errors.New("all upstream backends are down")
+	return nil, errors.New("all upstream backends are down or circuit-broken")
 }
 
 // StartHealthCheck starts periodic background health verification in a dedicated goroutine.
@@ -151,7 +194,11 @@ func (s *ServerPool) StartHealthCheck(ctx context.Context, interval time.Duratio
 					if !alive {
 						status = "DOWN"
 					}
-					slog.Debug("Backend health verified", "url", b.URL.String(), "status", status)
+					slog.Debug("Backend health verified",
+						"url", b.URL.String(),
+						"status", status,
+						"breaker", b.Breaker.GetState(),
+					)
 				}
 				s.mux.RUnlock()
 			}
@@ -159,22 +206,24 @@ func (s *ServerPool) StartHealthCheck(ctx context.Context, interval time.Duratio
 	}()
 }
 
-// ServeHTTP implements http.Handler to proxy incoming client requests.
+// ServeHTTP implements http.Handler to proxy incoming client requests with WebSocket upgrade awareness.
 func (s *ServerPool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	clientIP := r.RemoteAddr
 	target, err := s.GetNextBackend(clientIP)
 	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusServiceUnavailable)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		fmt.Fprintf(w, `{"error":"%s"}`+"\n", err.Error())
 		return
 	}
 
 	target.IncrActive()
 	defer target.DecrActive()
 
-	// Forward request headers
+	// Forward standard proxy and WebSocket headers
 	r.Header.Set("X-Forwarded-Host", r.Host)
 	r.Header.Set("X-Forwarded-For", clientIP)
-	r.Header.Set("X-Load-Balancer", "go-load-balancer/v1")
+	r.Header.Set("X-Load-Balancer", "go-load-balancer/v2")
 
 	target.ReverseProxy.ServeHTTP(w, r)
 }

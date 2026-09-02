@@ -12,6 +12,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/akmalkhaniub/go-load-balancer/pkg/api"
 	"github.com/akmalkhaniub/go-load-balancer/pkg/backend"
 	"github.com/akmalkhaniub/go-load-balancer/pkg/balancer"
 	"github.com/akmalkhaniub/go-load-balancer/pkg/metrics"
@@ -56,7 +57,7 @@ func main() {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	slog.SetDefault(logger)
 
-	slog.Info("Initializing Go Load Balancer",
+	slog.Info("Initializing Go Load Balancer v2 with Circuit Breakers & Dynamic Topology API",
 		"port", *port,
 		"algorithm", *algoFlag,
 		"backends", *backendsFlag,
@@ -91,8 +92,9 @@ func main() {
 	defer cancel()
 	pool.StartHealthCheck(ctx, *checkInterval)
 
-	// Setup metrics collector
+	// Setup metrics collector & Admin Server
 	metricCollector := metrics.NewMetricsCollector(pool.GetBackends)
+	adminServer := api.NewAdminServer(pool)
 
 	// Build main HTTP router
 	mainMux := http.NewServeMux()
@@ -101,6 +103,7 @@ func main() {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte(`{"status":"healthy"}` + "\n"))
 	})
+	mainMux.Handle("/api/", adminServer.Handler())
 	mainMux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		metricCollector.IncrRequests()
 		pool.ServeHTTP(w, r)
